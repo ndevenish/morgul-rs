@@ -1,14 +1,22 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
+#[cxx::bridge(namespace = "sls")]
+mod ffi {
+    unsafe extern "C++" {
+        include!("sls/Receiver.h");
+        include!("sls_receiver/include/sls_receiver_util.h");
+
+        type Receiver;
+
+        fn make_receiver(port: u16) -> UniquePtr<Receiver>;
+
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::ffi::*;
 
     #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
+    fn test_create() {
+        let r = make_receiver(30001);
     }
 }
