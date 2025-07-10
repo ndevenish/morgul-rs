@@ -1,7 +1,3 @@
-use std::path::Path;
-
-use cxx_build::CFG;
-
 fn main() {
     // CFG.exported_header_dirs.push(Path::new());
     cxx_build::bridge("src/lib.rs")
