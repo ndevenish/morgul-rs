@@ -1,3 +1,0 @@
-[submodule "sls_receiver/slsDetectorPackage"]
-	path = sls_receiver/slsDetectorPackage
-	url = git@github.com:slsdetectorgroup/slsDetectorPackage.git
