@@ -1,8 +1,11 @@
 use bytemuck::{Pod, Zeroable};
 use clap::Parser;
 use pnet::datalink;
+use socket2::{Domain, Socket, Type};
+use std::fs::soft_link;
 use std::iter;
-use std::net::{Ipv4Addr, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+
 use std::thread;
 
 const MAX_LISTENERS: u16 = 36;
@@ -93,8 +96,13 @@ fn allocate_image_buffer() -> Box<[u8]> {
 }
 
 fn listen_port(address: &Ipv4Addr, port: u16) -> ! {
-    let bind_addr = format!("{address}:{port}");
-    let socket = UdpSocket::bind(bind_addr).unwrap();
+    let bind_addr: SocketAddr = format!("{address}:{port}").parse().unwrap();
+    // let socket = UdpSocket::bind(bind_addr).unwrap();
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, None).unwrap();
+    socket.set_recv_buffer_size(512 * 1024 * 1025).unwrap();
+    socket.bind(&bind_addr.into()).unwrap();
+    let socket: UdpSocket = socket.into();
+
     println!("{port}: Listening to {address}");
 
     // The UDP receive buffer
