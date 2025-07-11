@@ -3,10 +3,12 @@ use clap::Parser;
 use pnet::datalink;
 use socket2::{Domain, Socket, Type};
 use std::fs::soft_link;
+use std::io::ErrorKind;
 use std::iter;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 
 use std::thread;
+use std::time::Duration;
 
 const MAX_LISTENERS: u16 = 36;
 const MODULE_SIZE_X: usize = 1024;
@@ -115,14 +117,47 @@ fn listen_port(address: &Ipv4Addr, port: u16) -> ! {
         .collect();
 
     let mut last_image = None;
+    let mut images_seen = 0usize;
+    let mut packets_dropped = 0usize;
+    let mut complete_images = 0usize;
     loop {
-        let packet_size = socket.recv(&mut buffer).unwrap();
+        let packet_size = match socket.recv(&mut buffer) {
+            Ok(size) => size,
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                println!(
+                    "Got end of acquisition, seen {images_seen} images, {complete_images} complete, {packets_dropped} packets dropped."
+                );
+                images_seen = 0;
+                packets_dropped = 0;
+                complete_images = 0;
+                socket.set_read_timeout(None).unwrap();
+                continue;
+            }
+            Err(e) => {
+                panic!("Error: {e}");
+            }
+        };
+        // Set 500ms timeout so that waits partway through an image fail
+        socket
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+
         let header: &SlsDetectorHeader =
             bytemuck::from_bytes(&buffer[..size_of::<SlsDetectorHeader>()]);
 
         assert!(header.packet_number < 64);
         assert!(packet_size - size_of::<SlsDetectorHeader>() == 8192);
 
+        // If no previous image, then we have a new one
+        if last_image.is_none() {
+            if images_seen == 0 {
+                println!(
+                    "New Acquisition started with frame number {}",
+                    header.frame_number
+                );
+            }
+            images_seen += 1;
+        }
         // Get the current WIP image or make a new one
         let mut current_image = last_image.take().unwrap_or_else(|| ReceiveImage {
             frame_number: header.frame_number,
@@ -141,7 +176,6 @@ fn listen_port(address: &Ipv4Addr, port: u16) -> ! {
                 );
                 continue;
             }
-
             // Warn if we didn't receive the entire previous frame
             if current_image.received_packets < 64 {
                 println!(
@@ -149,10 +183,12 @@ fn listen_port(address: &Ipv4Addr, port: u16) -> ! {
                     current_image.frame_number,
                     64 - current_image.received_packets
                 );
+                packets_dropped += 64 - current_image.received_packets;
                 // Return the data back to the pool to simulate sending it
                 spare_images.push(current_image.data);
             }
-
+            // Even though we didn't complete the previous image, this is a new one
+            images_seen += 1;
             // Make a new image
             current_image = ReceiveImage {
                 frame_number: header.frame_number,
@@ -178,7 +214,8 @@ fn listen_port(address: &Ipv4Addr, port: u16) -> ! {
             // );
             spare_images.push(current_image.data);
             last_image = None;
-            socket.set_read_timeout(None).unwrap();
+            complete_images += 1;
+            // socket.set_read_timeout(None).unwrap();
         } else {
             last_image = Some(current_image);
         }
