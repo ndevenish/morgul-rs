@@ -99,7 +99,9 @@ fn allocate_image_buffer() -> Box<[u8]> {
 }
 
 fn listen_port(address: &Ipv4Addr, port: u16) -> ! {
-    set_current_thread_priority(thread_priority::ThreadPriority::Max).unwrap();
+    if let Err(_) = set_current_thread_priority(thread_priority::ThreadPriority::Max) {
+        println!("{port}: Warning: Could not set thread priority. Are you running as root?");
+    };
     let bind_addr: SocketAddr = format!("{address}:{port}").parse().unwrap();
     // let socket = UdpSocket::bind(bind_addr).unwrap();
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, None).unwrap();
@@ -127,7 +129,7 @@ fn listen_port(address: &Ipv4Addr, port: u16) -> ! {
             Ok(size) => size,
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
                 println!(
-                    "Got end of acquisition, seen {images_seen} images, {complete_images} complete, {packets_dropped} packets dropped."
+                    "{port}: End of acquisition, seen {images_seen} images, {complete_images} complete, {packets_dropped} packets dropped."
                 );
                 images_seen = 0;
                 packets_dropped = 0;
