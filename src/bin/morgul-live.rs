@@ -164,12 +164,13 @@ fn listen_port(address: &Ipv4Addr, port: u16) -> ! {
 
         // If we've received an entire image, then process it
         if current_image.received_packets == 64 {
-            println!(
-                "{port}: Received entire image {}",
-                current_image.frame_number
-            );
+            // println!(
+            //     "{port}: Received entire image {}",
+            //     current_image.frame_number
+            // );
             spare_images.push(current_image.data);
             last_image = None;
+            socket.set_read_timeout(None).unwrap();
         } else {
             last_image = Some(current_image);
         }

@@ -7,3 +7,6 @@ edition = "2024"
 bytemuck = { version = "1.23.1", features = ["derive"] }
 clap = { version = "4.5.41", features = ["derive"] }
 pnet = { version = "0.35.0", default-features = false, features = ["pnet_datalink", "std"] }
+
+[profile.release]
+debug = "line-tables-only"
