@@ -43,7 +43,7 @@ struct SlsDetectorHeader {
 #[derive(Parser, Debug)]
 #[command(version, about, long_about=None)]
 struct Args {
-    #[arg(default_value = "30000")]
+    #[arg(long, short, default_value = "30000")]
     udp_port: u16,
     // #[arg(default_value = "36")]
     // listeners: u16,
