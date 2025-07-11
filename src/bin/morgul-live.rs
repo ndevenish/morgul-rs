@@ -6,6 +6,7 @@ use std::fs::soft_link;
 use std::io::ErrorKind;
 use std::iter;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use thread_priority::set_current_thread_priority;
 
 use std::thread;
 use std::time::Duration;
@@ -98,6 +99,7 @@ fn allocate_image_buffer() -> Box<[u8]> {
 }
 
 fn listen_port(address: &Ipv4Addr, port: u16) -> ! {
+    set_current_thread_priority(thread_priority::ThreadPriority::Max).unwrap();
     let bind_addr: SocketAddr = format!("{address}:{port}").parse().unwrap();
     // let socket = UdpSocket::bind(bind_addr).unwrap();
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, None).unwrap();
@@ -178,11 +180,11 @@ fn listen_port(address: &Ipv4Addr, port: u16) -> ! {
             }
             // Warn if we didn't receive the entire previous frame
             if current_image.received_packets < 64 {
-                println!(
-                    "{port}: Lost packets: Image {} missed {} packets",
-                    current_image.frame_number,
-                    64 - current_image.received_packets
-                );
+                // println!(
+                //     "{port}: Lost packets: Image {} missed {} packets",
+                //     current_image.frame_number,
+                //     64 - current_image.received_packets
+                // );
                 packets_dropped += 64 - current_image.received_packets;
                 // Return the data back to the pool to simulate sending it
                 spare_images.push(current_image.data);
