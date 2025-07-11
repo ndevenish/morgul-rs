@@ -2,7 +2,6 @@ use bytemuck::{Pod, Zeroable};
 use clap::Parser;
 use pnet::datalink;
 use socket2::{Domain, Socket, Type};
-use std::fs::soft_link;
 use std::io::ErrorKind;
 use std::iter;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
@@ -99,7 +98,7 @@ fn allocate_image_buffer() -> Box<[u8]> {
 }
 
 fn listen_port(address: &Ipv4Addr, port: u16) -> ! {
-    if let Err(_) = set_current_thread_priority(thread_priority::ThreadPriority::Max) {
+    if set_current_thread_priority(thread_priority::ThreadPriority::Max).is_err() {
         println!("{port}: Warning: Could not set thread priority. Are you running as root?");
     };
     let bind_addr: SocketAddr = format!("{address}:{port}").parse().unwrap();
@@ -115,8 +114,7 @@ fn listen_port(address: &Ipv4Addr, port: u16) -> ! {
     let mut buffer = [0u8; size_of::<SlsDetectorHeader>() + 8192];
 
     // Build the image data buffers we will use
-    let mut spare_images: Vec<_> = std::iter::repeat(())
-        .take(THREAD_IMAGE_BUFFER_LENGTH)
+    let mut spare_images: Vec<_> = std::iter::repeat_n((), THREAD_IMAGE_BUFFER_LENGTH)
         .map(|()| allocate_image_buffer())
         .collect();
 
@@ -165,7 +163,7 @@ fn listen_port(address: &Ipv4Addr, port: u16) -> ! {
         // Get the current WIP image or make a new one
         let mut current_image = last_image.take().unwrap_or_else(|| ReceiveImage {
             frame_number: header.frame_number,
-            header: header.clone(),
+            header: *header,
             received_packets: 0,
             data: spare_images.pop().unwrap(),
         });
@@ -196,7 +194,7 @@ fn listen_port(address: &Ipv4Addr, port: u16) -> ! {
             // Make a new image
             current_image = ReceiveImage {
                 frame_number: header.frame_number,
-                header: header.clone(),
+                header: *header,
                 received_packets: 0,
                 data: spare_images.pop().unwrap(),
             }
@@ -234,14 +232,13 @@ fn main() {
 
     let mut threads = Vec::new();
     // Every IP address can cope with 9 streams of data
-    for (port, address) in (args.udp_port..(args.udp_port + MAX_LISTENERS)).zip(
-        interfaces
-            .iter()
-            .flat_map(|x| iter::repeat(x.clone()).take(9)),
-    ) {
+    for (port, address) in (args.udp_port..(args.udp_port + MAX_LISTENERS))
+        .zip(interfaces.iter().flat_map(|x| iter::repeat_n(*x, 9)))
+    {
         threads.push(thread::spawn(move || listen_port(&address, port)));
     }
 
+    #[allow(clippy::never_loop)]
     for thread in threads {
         thread.join().unwrap();
     }
