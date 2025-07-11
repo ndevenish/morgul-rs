@@ -6,6 +6,11 @@ use std::net::{Ipv4Addr, UdpSocket};
 use std::thread;
 
 const MAX_LISTENERS: u16 = 36;
+const MODULE_SIZE_X: usize = 1024;
+const MODULE_SIZE_Y: usize = 256;
+const NUM_PIXELS: usize = MODULE_SIZE_X * MODULE_SIZE_Y;
+const BIT_DEPTH: usize = 2;
+const THREAD_IMAGE_BUFFER_LENGTH: usize = 10;
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone, Zeroable, Pod)]
@@ -40,6 +45,23 @@ struct SlsDetectorHeader {
     version: u8,
 }
 
+struct ReceiveImage {
+    frame_number: u64,
+    header: SlsDetectorHeader,
+    received_packets: usize,
+    data: Box<[u8]>,
+}
+
+impl std::fmt::Debug for ReceiveImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReceiveImage")
+            .field("frame_number", &self.frame_number)
+            .field("header", &self.header)
+            .field("received_packets", &self.received_packets)
+            .finish()
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(version, about, long_about=None)]
 struct Args {
@@ -64,17 +86,93 @@ fn get_interface_addreses_with_prefix(prefix: u8) -> Vec<Ipv4Addr> {
     addresses
 }
 
+fn allocate_image_buffer() -> Box<[u8]> {
+    let mut empty_image = Vec::with_capacity(NUM_PIXELS * BIT_DEPTH);
+    empty_image.resize(MODULE_SIZE_X * MODULE_SIZE_Y * BIT_DEPTH, 0u8);
+    empty_image.into_boxed_slice()
+}
+
 fn listen_port(address: &Ipv4Addr, port: u16) -> ! {
     let bind_addr = format!("{address}:{port}");
     let socket = UdpSocket::bind(bind_addr).unwrap();
-    let mut buffer = [0u8; 9000];
-
     println!("{port}: Listening to {address}");
+
+    // The UDP receive buffer
+    let mut buffer = [0u8; size_of::<SlsDetectorHeader>() + 8192];
+
+    // Build the image data buffers we will use
+    let mut spare_images: Vec<_> = std::iter::repeat(())
+        .take(THREAD_IMAGE_BUFFER_LENGTH)
+        .map(|()| allocate_image_buffer())
+        .collect();
+
+    let mut last_image = None;
     loop {
         let packet_size = socket.recv(&mut buffer).unwrap();
         let header: &SlsDetectorHeader =
             bytemuck::from_bytes(&buffer[..size_of::<SlsDetectorHeader>()]);
-        println!("{port}: Received packet size={packet_size} header={header:?}");
+
+        assert!(header.packet_number < 64);
+        assert!(packet_size - size_of::<SlsDetectorHeader>() == 8192);
+
+        // Get the current WIP image or make a new one
+        let mut current_image = last_image.take().unwrap_or_else(|| ReceiveImage {
+            frame_number: header.frame_number,
+            header: header.clone(),
+            received_packets: 0,
+            data: spare_images.pop().unwrap(),
+        });
+
+        // We have a new image but didn't complete the previous frame
+        if header.frame_number != current_image.frame_number {
+            // Warn if we received packets for an old image
+            if header.frame_number < current_image.frame_number {
+                println!(
+                    "{port}: Warning: Received Out-Of-Order frame packets for image {} after closing.",
+                    header.frame_number
+                );
+                continue;
+            }
+
+            // Warn if we didn't receive the entire previous frame
+            if current_image.received_packets < 64 {
+                println!(
+                    "{port}: Lost packets: Image {} missed {} packets",
+                    current_image.frame_number,
+                    64 - current_image.received_packets
+                );
+                // Return the data back to the pool to simulate sending it
+                spare_images.push(current_image.data);
+            }
+
+            // Make a new image
+            current_image = ReceiveImage {
+                frame_number: header.frame_number,
+                header: header.clone(),
+                received_packets: 0,
+                data: spare_images.pop().unwrap(),
+            }
+        }
+        assert!(header.frame_number == current_image.frame_number);
+
+        // Add a packet to this image
+        current_image.received_packets += 1;
+        // Copy the new data into the image data at the right place
+        current_image.data[(header.packet_number as usize * 8192usize)
+            ..((header.packet_number as usize + 1) * 8192usize)]
+            .copy_from_slice(&buffer[size_of::<SlsDetectorHeader>()..]);
+
+        // If we've received an entire image, then process it
+        if current_image.received_packets == 64 {
+            println!(
+                "{port}: Received entire image {}",
+                current_image.frame_number
+            );
+            spare_images.push(current_image.data);
+            last_image = None;
+        } else {
+            last_image = Some(current_image);
+        }
     }
 }
 
