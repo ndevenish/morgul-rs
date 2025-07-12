@@ -1,10 +1,15 @@
 use bytemuck::{Pod, Zeroable};
 use clap::Parser;
+use nix::errno::Errno;
+use nix::sys::socket::{
+    ControlMessageOwned, MsgFlags, SockaddrStorage, recvmsg, setsockopt, sockopt,
+};
 use pnet::datalink;
 use socket2::{Domain, Socket, Type};
-use std::io::ErrorKind;
+use std::io::IoSliceMut;
 use std::iter;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::os::fd::AsRawFd;
 use thread_priority::set_current_thread_priority;
 
 use std::thread;
@@ -104,14 +109,34 @@ fn listen_port(address: &Ipv4Addr, port: u16) -> ! {
     let bind_addr: SocketAddr = format!("{address}:{port}").parse().unwrap();
     // let socket = UdpSocket::bind(bind_addr).unwrap();
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, None).unwrap();
-    socket.set_recv_buffer_size(512 * 1024 * 1025).unwrap();
+    socket.set_recv_buffer_size(1024 * 1024 * 1024).unwrap();
     socket.bind(&bind_addr.into()).unwrap();
+    setsockopt(&socket, sockopt::RxqOvfl, &1).unwrap();
     let socket: UdpSocket = socket.into();
-
     println!("{port}: Listening to {address}");
 
     // The UDP receive buffer
     let mut buffer = [0u8; size_of::<SlsDetectorHeader>() + 8192];
+
+    // let mut buf = vec![0u8; 1500];
+    // let mut cmsgspace = nix::cmsg_space!(libc::c_uint);
+
+    // let msg = recvmsg::<SockaddrStorage>(
+    //     fd,
+    //     &[nix::sys::uio::IoVec::from_mut_slice(&mut buf)],
+    //     Some(&mut cmsgspace),
+    //     MsgFlags::empty(),
+    // )
+    // .expect("recvmsg failed");
+
+    // for cmsg in msg.cmsgs() {
+    //     if let ControlMessageOwned::RxqOvfl(count) = cmsg {
+    //         println!("Packet queue overflowed! {} packets dropped.", count);
+    //     }
+    // }
+    let fd = socket.as_raw_fd();
+    let mut iov = [IoSliceMut::new(&mut buffer)];
+    let mut cmsgspace = nix::cmsg_space!(libc::c_uint);
 
     // Build the image data buffers we will use
     let mut spare_images: Vec<_> = std::iter::repeat_n((), THREAD_IMAGE_BUFFER_LENGTH)
@@ -123,9 +148,14 @@ fn listen_port(address: &Ipv4Addr, port: u16) -> ! {
     let mut packets_dropped = 0usize;
     let mut complete_images = 0usize;
     loop {
-        let packet_size = match socket.recv(&mut buffer) {
-            Ok(size) => size,
-            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+        let msg = match recvmsg::<SockaddrStorage>(
+            fd,
+            &mut iov,
+            Some(&mut cmsgspace),
+            MsgFlags::empty(),
+        ) {
+            Ok(msg) => msg,
+            Err(Errno::EAGAIN) => {
                 println!(
                     "{port}: End of acquisition, seen {images_seen} images, {complete_images} complete, {packets_dropped} packets dropped."
                 );
@@ -139,6 +169,38 @@ fn listen_port(address: &Ipv4Addr, port: u16) -> ! {
                 panic!("Error: {e}");
             }
         };
+
+        for cmsg in msg.cmsgs().unwrap() {
+            if let ControlMessageOwned::RxqOvfl(count) = cmsg {
+                println!(
+                    "{port}: Packet queue overflowed! {} packets dropped.",
+                    count
+                );
+            } else {
+                println!("{port}: Got ControlMessage: {cmsg:?}");
+            }
+        }
+
+        // Unwrap the buffer
+        let buffer = msg.iovs().next().unwrap();
+        let packet_size = msg.bytes;
+
+        // let packet_size = match socket.recv(&mut buffer) {
+        //     Ok(size) => size,
+        //     Err(e) if e.kind() == ErrorKind::WouldBlock => {
+        //         println!(
+        //             "{port}: End of acquisition, seen {images_seen} images, {complete_images} complete, {packets_dropped} packets dropped."
+        //         );
+        //         images_seen = 0;
+        //         packets_dropped = 0;
+        //         complete_images = 0;
+        //         socket.set_read_timeout(None).unwrap();
+        //         continue;
+        //     }
+        //     Err(e) => {
+        //         panic!("Error: {e}");
+        //     }
+        // };
         // Set 500ms timeout so that waits partway through an image fail
         socket
             .set_read_timeout(Some(Duration::from_millis(500)))
@@ -165,7 +227,7 @@ fn listen_port(address: &Ipv4Addr, port: u16) -> ! {
             frame_number: header.frame_number,
             header: *header,
             received_packets: 0,
-            data: spare_images.pop().unwrap(),
+            data: spare_images.pop().expect("Ran out of spare packet buffers"),
         });
 
         // We have a new image but didn't complete the previous frame
@@ -173,8 +235,8 @@ fn listen_port(address: &Ipv4Addr, port: u16) -> ! {
             // Warn if we received packets for an old image
             if header.frame_number < current_image.frame_number {
                 println!(
-                    "{port}: Warning: Received Out-Of-Order frame packets for image {} after closing.",
-                    header.frame_number
+                    "{port}: Warning: Received Out-Of-Order frame packets for image {} (current={}) after closing.",
+                    header.frame_number, current_image.frame_number,
                 );
                 continue;
             }
