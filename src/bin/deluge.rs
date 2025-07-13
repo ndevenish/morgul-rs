@@ -3,7 +3,7 @@ use std::{
     net::{Ipv4Addr, SocketAddr, UdpSocket},
     sync::{Arc, Barrier},
     thread::{self, sleep},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use bytemuck::{Zeroable, bytes_of};
@@ -37,13 +37,21 @@ fn send_data(
     let mut buff = vec![0u8; 8192 + size_of::<SlsDetectorHeader>()];
     let mut header = SlsDetectorHeader::zeroed();
 
+    let mut last_send = Instant::now();
+    let exp_time = 0.0005;
     loop {
         sync.wait();
         println!("{target_port}: Starting send");
-        for _ in 0..1000 {
+        for _ in 0..10000 {
             for _ in 0..64 {
                 buff[..size_of::<SlsDetectorHeader>()].copy_from_slice(bytes_of(&header));
+
+                let wait = exp_time - (Instant::now() - last_send).as_secs_f32();
+                if wait > 0.0 {
+                    thread::sleep(Duration::from_secs_f32(wait));
+                }
                 socket.send_to(&buff, to_addr).unwrap();
+                last_send = Instant::now();
                 header.packet_number += 1;
             }
             header.frame_number += 1;
