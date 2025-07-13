@@ -42,9 +42,9 @@ fn send_data(
         println!("{target_port}: Starting send");
         for _ in 0..1000 {
             for _ in 0..64 {
-                header.packet_number += 1;
                 buff[..size_of::<SlsDetectorHeader>()].copy_from_slice(bytes_of(&header));
                 socket.send_to(&buff, to_addr).unwrap();
+                header.packet_number += 1;
             }
             header.frame_number += 1;
             header.packet_number = 0;
