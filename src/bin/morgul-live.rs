@@ -291,13 +291,28 @@ fn main() {
     println!("Args: {args:?}");
 
     let interfaces = get_interface_addreses_with_prefix(192);
-
+    if interfaces.is_empty() {
+        println!("Error: Could not find any 192. interfaces. Have you set up the network?");
+        std::process::exit(1);
+    }
+    // Get a list of cores so that we can set affinity to them
+    let mut core_ids = core_affinity::get_core_ids().unwrap().into_iter().rev();
+    println!("{core_ids:?}");
+    println!("Start threads");
     let mut threads = Vec::new();
     // Every IP address can cope with 9 streams of data
     for (port, address) in (args.udp_port..(args.udp_port + MAX_LISTENERS))
         .zip(interfaces.iter().flat_map(|x| iter::repeat_n(*x, 9)))
     {
-        threads.push(thread::spawn(move || listen_port(&address, port)));
+        let core = core_ids.next().unwrap();
+        threads.push(thread::spawn(move || {
+            if !core_affinity::set_for_current(core) {
+                println!("{port}: Failed to set affinity to core {}", core.id);
+            } else {
+                println!("{port}: Setting affinity to CPU {}", core.id);
+            }
+            listen_port(&address, port);
+        }));
     }
 
     #[allow(clippy::never_loop)]
