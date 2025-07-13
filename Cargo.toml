@@ -7,6 +7,7 @@ edition = "2024"
 bytemuck = { version = "1.23.1", features = ["derive"] }
 clap = { version = "4.5.41", features = ["derive"] }
 core_affinity = "0.8.3"
+itertools = "0.14.0"
 libc = "0.2.174"
 nix = { version = "0.30.1", features = ["socket", "uio"] }
 pnet = { version = "0.35.0", default-features = false, features = ["pnet_datalink", "std"] }

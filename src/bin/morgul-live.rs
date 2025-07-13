@@ -1,10 +1,10 @@
-use bytemuck::{Pod, Zeroable};
 use clap::Parser;
+use morgul::{SlsDetectorHeader, get_interface_addreses_with_prefix};
 use nix::errno::Errno;
 use nix::sys::socket::{
     ControlMessageOwned, MsgFlags, SockaddrStorage, recvmsg, setsockopt, sockopt,
 };
-use pnet::datalink;
+
 use socket2::{Domain, Socket, Type};
 use std::io::IoSliceMut;
 use std::iter;
@@ -21,39 +21,6 @@ const MODULE_SIZE_Y: usize = 256;
 const NUM_PIXELS: usize = MODULE_SIZE_X * MODULE_SIZE_Y;
 const BIT_DEPTH: usize = 2;
 const THREAD_IMAGE_BUFFER_LENGTH: usize = 10;
-
-#[repr(C)]
-#[derive(Debug, Copy, Clone, Zeroable, Pod)]
-struct SlsDetectorHeader {
-    /// Frame number to which the current packet belongs to
-    frame_number: u64,
-    /// Measured exposure time of the frame in tenths of microsecond (100ns)
-    exposure_length: u32,
-    /// Packet number of the frame to which the current data belongs to.
-    packet_number: u32,
-    /// detSpec1: Bunch identification number received by the detector at the moment of frame acquisition.
-    bunch_id: u64,
-    /// Time measured at the start of frame exposure since the start of the current measurement. It is expressed in tenths of microsecond.
-    timestamp: u64,
-    /// module ID picked up from det_id_[detector type].txt on the detector cpu
-    module_id: u16,
-    /// row position of the module in the detector system. It is calculated by the order of the module in hostname command, as well as the detsize command. The modules are stacked row by row until they reach the y-axis limit set by detsize (if specified). Then, stacking continues in the next column and so on.
-    row: u16,
-    /// column position of the module in the detector system. It is calculated by the order of the module in hostname command, as well as the detsize command. The modules are stacked row by row until they reach the y-axis limit set by detsize (if specified). Then, stacking continues in the next column and so on.
-    column: u16,
-    /// Unused for Jungfrau
-    _det_spec_2: u16,
-    /// DAQ Info field: See https://slsdetectorgroup.github.io/devdoc/udpdetspec.html#id10
-    daq_info: u32,
-    /// Unused for Jungfrau
-    _det_spec_4: u16,
-
-    /// detector type from enum of detectorType in the package.
-    det_type: u8,
-
-    /// Current version of the detector header
-    version: u8,
-}
 
 struct ReceiveImage {
     frame_number: u64,
@@ -79,21 +46,6 @@ struct Args {
     udp_port: u16,
     // #[arg(default_value = "36")]
     // listeners: u16,
-}
-
-fn get_interface_addreses_with_prefix(prefix: u8) -> Vec<Ipv4Addr> {
-    let mut addresses: Vec<_> = datalink::interfaces()
-        .iter()
-        .flat_map(|x| &x.ips)
-        .flat_map(|x| match x {
-            pnet::ipnetwork::IpNetwork::V4(ip) => Some(ip),
-            _ => None,
-        })
-        .map(|x| x.ip())
-        .filter(|x| x.octets()[0] == prefix)
-        .collect();
-    addresses.sort();
-    addresses
 }
 
 fn allocate_image_buffer() -> Box<[u8]> {
