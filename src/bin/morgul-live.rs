@@ -238,6 +238,7 @@ fn listen_port(address: &Ipv4Addr, port: u16) -> ! {
                     "{port}: Warning: Received Out-Of-Order frame packets for image {} (current={}) after closing.",
                     header.frame_number, current_image.frame_number,
                 );
+                last_image = Some(current_image);
                 continue;
             }
             // Warn if we didn't receive the entire previous frame
