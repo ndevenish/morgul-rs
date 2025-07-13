@@ -29,7 +29,7 @@ fn send_data(
     source_address: &Ipv4Addr,
     target_address: &Ipv4Addr,
     target_port: u16,
-    sync: &Barrier,
+    sync: Arc<Barrier>,
 ) -> ! {
     let bind_addr: SocketAddr = format!("{source_address}:0").parse().unwrap();
     let to_addr: SocketAddr = format!("{target_address}:{target_port}").parse().unwrap();
@@ -39,17 +39,18 @@ fn send_data(
 
     loop {
         sync.wait();
-        for _ in 0..64 {
-            header.packet_number += 1;
-            buff[..size_of::<SlsDetectorHeader>()].copy_from_slice(bytes_of(&header));
-            socket.send_to(&buff, to_addr).unwrap();
+        println!("{target_port}: Starting send");
+        for _ in 0..1000 {
+            for _ in 0..64 {
+                header.packet_number += 1;
+                buff[..size_of::<SlsDetectorHeader>()].copy_from_slice(bytes_of(&header));
+                socket.send_to(&buff, to_addr).unwrap();
+            }
+            header.frame_number += 1;
+            header.packet_number = 0;
         }
-        header.frame_number += 1;
-        header.packet_number = 0;
-        break;
+        println!("Sent 1000 images");
     }
-    println!(">{target_port}: Sent 64 packets to {to_addr}");
-    loop {}
 }
 
 fn main() {
@@ -82,14 +83,15 @@ fn main() {
             .chain(iter::repeat_n(args.target_2.unwrap_or(args.target), 9))
             .skip(to_take),
     )) {
+        println!("Starting {source} -> {target}:{port}");
         let bar = barrier.clone();
         threads.push(thread::spawn(move || {
-            send_data(&source, &target, port, &bar);
+            send_data(&source, &target, port, bar);
         }));
     }
-    // loop {
-    sleep(Duration::from_secs(5));
-    println!("Sending Deluge");
-    barrier.wait();
-    // }
+    loop {
+        sleep(Duration::from_secs(5));
+        println!("Sending Deluge");
+        barrier.wait();
+    }
 }
