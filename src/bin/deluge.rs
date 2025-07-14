@@ -42,7 +42,7 @@ fn send_data(
     loop {
         sync.wait();
         println!("{target_port}: Starting send");
-        for _ in 0..10000 {
+        loop {
             for _ in 0..64 {
                 buff[..size_of::<SlsDetectorHeader>()].copy_from_slice(bytes_of(&header));
 
@@ -50,8 +50,8 @@ fn send_data(
                 if wait > 0.0 {
                     thread::sleep(Duration::from_secs_f32(wait));
                 }
-                socket.send_to(&buff, to_addr).unwrap();
                 last_send = Instant::now();
+                socket.send_to(&buff, to_addr).unwrap();
                 header.packet_number += 1;
             }
             header.frame_number += 1;
@@ -97,9 +97,9 @@ fn main() {
             send_data(&source, &target, port, bar);
         }));
     }
-    loop {
-        sleep(Duration::from_secs(5));
-        println!("Sending Deluge");
-        barrier.wait();
-    }
+    barrier.wait();
+    // loop {
+    //     sleep(Duration::from_secs(5));
+    //     println!("Sending Deluge");
+    // }
 }
