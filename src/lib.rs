@@ -4,11 +4,20 @@ use bytemuck::{Pod, Zeroable};
 use pnet::datalink;
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, Zeroable, Pod)]
+#[derive(Debug, Copy, Clone, Zeroable, Pod)]
 pub struct DelugeTrigger {
     pub frames: u128,
     pub exptime: f32,
-    _padding: [u8; 12],
+    pub uuid: [u8; 12],
+}
+impl Default for DelugeTrigger {
+    fn default() -> Self {
+        DelugeTrigger {
+            frames: 0,
+            exptime: 0.0,
+            uuid: rand::random(),
+        }
+    }
 }
 
 #[repr(C)]

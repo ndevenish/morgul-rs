@@ -1,5 +1,5 @@
 use std::{
-    io,
+    io::{self, Write},
     iter::{self},
     net::{Ipv4Addr, SocketAddr, UdpSocket},
     sync::{Arc, Barrier},
@@ -54,7 +54,7 @@ fn send_data(
         );
         // println!("{target_port}: Starting send");
         let start_acq = Instant::now();
-        for image_num in 0..2000 {
+        for image_num in 0..acq.frames {
             let acq_elapsed = (Instant::now() - start_acq).as_secs_f32();
             if acq_elapsed < image_num as f32 * acq.exptime {
                 thread::sleep(Duration::from_secs_f32(
@@ -72,10 +72,12 @@ fn send_data(
             header.packet_number = 0;
         }
         println!("{target_port}: Sent {} images", acq.frames);
+        std::io::stdout().flush().unwrap();
         let sync_result = sync.wait();
         if sync_result.is_leader() {
             println!(
-                "Sent 2000 images in {:.0}",
+                "Sent {} images in {:.0} ms",
+                acq.frames,
                 (Instant::now() - start_acq).as_millis()
             );
         }
@@ -142,27 +144,22 @@ fn main() {
     // let broad = UdpSocket::bind("0.0.0.0:9999").unwrap();
     // broad.recv(buf)
     // let mut last_trigger = None;
-    let mut last_trigger = None;
+    let mut last_trigger: Option<DelugeTrigger> = None;
     loop {
         if let Ok(size) = broad.recv(buf.as_mut_slice()) {
             assert!(size == size_of::<DelugeTrigger>());
             let trigger: &DelugeTrigger = bytemuck::from_bytes(&buf);
-            // Ignore retriggers within 0.5 s
+
+            // Ignore retriggers with the same UUID
             if let Some(last) = last_trigger
-                && (Instant::now() - last) < Duration::from_millis(500)
+                && last.uuid == trigger.uuid
             {
-                last_trigger = Some(Instant::now());
                 continue;
             }
 
             bus.broadcast(*trigger);
-            // trigger_tx.send(*trigger).unwrap();
 
-            // println!("Rec: {:?}", trigger_rx.receiver_count());
-            // println!(" Getting: {:?}", trigger_rx.recv());
-            // println!(" Barrier: {:?}", barrier.)
-            barrier.wait();
-            last_trigger = Some(Instant::now());
+            last_trigger = Some(*trigger);
         }
     }
 }
