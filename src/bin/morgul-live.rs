@@ -124,10 +124,7 @@ fn listen_port(address: &Ipv4Addr, port: u16) -> ! {
 
         for cmsg in msg.cmsgs().unwrap() {
             if let ControlMessageOwned::RxqOvfl(count) = cmsg {
-                println!(
-                    "{port}: Packet queue overflowed! {} packets dropped.",
-                    count
-                );
+                println!("{port}: Packet queue overflowed! {count} packets dropped.",);
             } else {
                 println!("{port}: Got ControlMessage: {cmsg:?}");
             }
