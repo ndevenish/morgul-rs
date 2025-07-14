@@ -2,7 +2,7 @@ use std::{
     iter::{self},
     net::{Ipv4Addr, SocketAddr, UdpSocket},
     sync::{Arc, Barrier},
-    thread::{self, sleep},
+    thread::{self},
     time::{Duration, Instant},
 };
 
@@ -37,27 +37,35 @@ fn send_data(
     let mut buff = vec![0u8; 8192 + size_of::<SlsDetectorHeader>()];
     let mut header = SlsDetectorHeader::zeroed();
 
-    let mut last_send = Instant::now();
+    // let mut last_send = Instant::now();
     let exp_time = 0.0005;
     loop {
-        sync.wait();
-        println!("{target_port}: Starting send");
-        loop {
+        let sync_result = sync.wait();
+        // println!("{target_port}: Starting send");
+        let start_acq = Instant::now();
+        for image_num in 0..2000 {
+            let acq_elapsed = (Instant::now() - start_acq).as_secs_f32();
+            if acq_elapsed < image_num as f32 * exp_time {
+                thread::sleep(Duration::from_secs_f32(
+                    image_num as f32 * exp_time - acq_elapsed,
+                ));
+            }
             for _ in 0..64 {
                 buff[..size_of::<SlsDetectorHeader>()].copy_from_slice(bytes_of(&header));
 
-                let wait = exp_time - (Instant::now() - last_send).as_secs_f32();
-                if wait > 0.0 {
-                    thread::sleep(Duration::from_secs_f32(wait));
-                }
-                last_send = Instant::now();
                 socket.send_to(&buff, to_addr).unwrap();
                 header.packet_number += 1;
             }
+
             header.frame_number += 1;
             header.packet_number = 0;
         }
-        println!("Sent 1000 images");
+        if sync_result.is_leader() {
+            println!(
+                "Sent 2000 images in {:.0}",
+                (Instant::now() - start_acq).as_millis()
+            );
+        }
     }
 }
 
@@ -98,8 +106,9 @@ fn main() {
         }));
     }
     barrier.wait();
-    // loop {
-    //     sleep(Duration::from_secs(5));
-    //     println!("Sending Deluge");
-    // }
+    loop {
+        barrier.wait();
+        // sleep(Duration::from_secs(5));
+        // println!("Sending Deluge");
+    }
 }
