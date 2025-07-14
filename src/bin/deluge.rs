@@ -44,32 +44,41 @@ fn send_data(
     let mut buff = vec![0u8; 8192 + size_of::<SlsDetectorHeader>()];
     let mut header = SlsDetectorHeader::zeroed();
 
-    let mut last_send = Instant::now();
+    sync.wait();
     loop {
-        sync.wait();
         let acq = trigger.recv().unwrap();
         println!(
             "{target_port}: Starting {} images at {:.0} Hz",
             acq.frames,
             1.0 / acq.exptime
         );
-        for _ in 0..acq.frames {
+        // println!("{target_port}: Starting send");
+        let start_acq = Instant::now();
+        for image_num in 0..2000 {
+            let acq_elapsed = (Instant::now() - start_acq).as_secs_f32();
+            if acq_elapsed < image_num as f32 * acq.exptime {
+                thread::sleep(Duration::from_secs_f32(
+                    image_num as f32 * acq.exptime - acq_elapsed,
+                ));
+            }
             for _ in 0..64 {
                 buff[..size_of::<SlsDetectorHeader>()].copy_from_slice(bytes_of(&header));
 
-                let wait = acq.exptime - (Instant::now() - last_send).as_secs_f32();
-                if wait > 0.0 {
-                    println!("Wait: {wait}");
-                    thread::sleep(Duration::from_secs_f32(wait));
-                }
-                last_send = Instant::now();
                 socket.send_to(&buff, to_addr).unwrap();
                 header.packet_number += 1;
             }
+
             header.frame_number += 1;
             header.packet_number = 0;
         }
         println!("{target_port}: Sent {} images", acq.frames);
+        let sync_result = sync.wait();
+        if sync_result.is_leader() {
+            println!(
+                "Sent 2000 images in {:.0}",
+                (Instant::now() - start_acq).as_millis()
+            );
+        }
     }
 }
 
