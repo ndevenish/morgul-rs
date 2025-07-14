@@ -186,10 +186,10 @@ fn listen_port(address: &Ipv4Addr, port: u16) -> ! {
         if header.frame_number != current_image.frame_number {
             // Warn if we received packets for an old image
             if header.frame_number < current_image.frame_number {
-                println!(
-                    "{port}: Warning: Received Out-Of-Order frame packets for image {} (current={}) after closing.",
-                    header.frame_number, current_image.frame_number,
-                );
+                // println!(
+                //     "{port}: Warning: Received Out-Of-Order frame packets for image {} (current={}) after closing.",
+                //     header.frame_number, current_image.frame_number,
+                // );
                 last_image = Some(current_image);
                 continue;
             }

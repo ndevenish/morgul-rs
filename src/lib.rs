@@ -5,6 +5,14 @@ use pnet::datalink;
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone, Zeroable, Pod)]
+pub struct DelugeTrigger {
+    pub frames: u128,
+    pub exptime: f32,
+    _padding: [u8; 12],
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Zeroable, Pod)]
 pub struct SlsDetectorHeader {
     /// Frame number to which the current packet belongs to
     pub frame_number: u64,
