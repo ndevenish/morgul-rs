@@ -10,6 +10,7 @@ use std::io::IoSliceMut;
 use std::iter;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::os::fd::AsRawFd;
+use std::sync::{Arc, Barrier};
 use thread_priority::set_current_thread_priority;
 
 use std::thread;
@@ -54,11 +55,11 @@ fn allocate_image_buffer() -> Box<[u8]> {
     empty_image.into_boxed_slice()
 }
 
-fn listen_port(address: &Ipv4Addr, port: u16) -> ! {
+fn listen_port(address: &Ipv4Addr, port: u16, barrier: Arc<Barrier>) -> ! {
     if set_current_thread_priority(thread_priority::ThreadPriority::Max).is_err() {
         println!("{port}: Warning: Could not set thread priority. Are you running as root?");
     };
-    let bind_addr: SocketAddr = format!("{address}:{port}").parse().unwrap();
+    let bind_addr: SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
     // let socket = UdpSocket::bind(bind_addr).unwrap();
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, None).unwrap();
     socket.set_recv_buffer_size(1024 * 1024 * 1024).unwrap();
@@ -99,7 +100,10 @@ fn listen_port(address: &Ipv4Addr, port: u16) -> ! {
     let mut images_seen = 0usize;
     let mut packets_dropped = 0usize;
     let mut complete_images = 0usize;
+    let mut out_of_order = 0usize;
+
     loop {
+        // barrier.wait();
         let msg = match recvmsg::<SockaddrStorage>(
             fd,
             &mut iov,
@@ -109,12 +113,17 @@ fn listen_port(address: &Ipv4Addr, port: u16) -> ! {
             Ok(msg) => msg,
             Err(Errno::EAGAIN) => {
                 println!(
-                    "{port}: End of acquisition, seen {images_seen} images, {complete_images} complete, {packets_dropped} packets dropped."
+                    "{port}: End of acquisition, seen {images_seen} images, {complete_images} complete, {packets_dropped} packets dropped, {out_of_order} out-of-order."
                 );
                 images_seen = 0;
                 packets_dropped = 0;
                 complete_images = 0;
+                out_of_order = 0;
                 socket.set_read_timeout(None).unwrap();
+                let b = barrier.wait();
+                if b.is_leader() {
+                    println!("All threads finished acquisition.");
+                }
                 continue;
             }
             Err(e) => {
@@ -187,6 +196,8 @@ fn listen_port(address: &Ipv4Addr, port: u16) -> ! {
                 //     "{port}: Warning: Received Out-Of-Order frame packets for image {} (current={}) after closing.",
                 //     header.frame_number, current_image.frame_number,
                 // );
+
+                out_of_order += 1;
                 last_image = Some(current_image);
                 continue;
             }
@@ -249,26 +260,36 @@ fn main() {
     let mut core_ids = core_affinity::get_core_ids().unwrap().into_iter().rev();
     println!("{core_ids:?}");
     println!("Start threads");
+
+    let barrier = Arc::new(Barrier::new(std::cmp::min(
+        interfaces.len() * 9,
+        MAX_LISTENERS as usize,
+    )));
+
     let mut threads = Vec::new();
     // Every IP address can cope with 9 streams of data
     for (port, address) in (args.udp_port..(args.udp_port + MAX_LISTENERS))
         .zip(interfaces.iter().flat_map(|x| iter::repeat_n(*x, 9)))
     {
         let core = core_ids.next().unwrap();
+        let barr = barrier.clone();
         threads.push(thread::spawn(move || {
             if !core_affinity::set_for_current(core) {
                 println!("{port}: Failed to set affinity to core {}", core.id);
             } else {
                 println!("{port}: Setting affinity to CPU {}", core.id);
             }
-            listen_port(&address, port);
+            listen_port(&address, port, barr);
         }));
     }
 
-    #[allow(clippy::never_loop)]
-    for thread in threads {
-        thread.join().unwrap();
+    loop {
+        thread::sleep(Duration::from_secs(20));
     }
+    // #[allow(clippy::never_loop)]
+    // for thread in threads {
+    //     thread.join().unwrap();
+    // }
     // thread::spawn(f)
     // let ip = vec![
     //     "192.168.201.101",
