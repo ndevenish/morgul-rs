@@ -4,7 +4,7 @@ use bytemuck::{Pod, Zeroable};
 use pnet::datalink;
 
 #[repr(C)]
-#[derive(Debug, Copy, Clone, Zeroable, Pod)]
+#[derive(Debug, Default, Copy, Clone, Zeroable, Pod)]
 pub struct DelugeTrigger {
     pub frames: u128,
     pub exptime: f32,

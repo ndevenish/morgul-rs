@@ -25,6 +25,10 @@ struct Args {
     to_first: Option<u8>,
     target: Ipv4Addr,
     target_2: Option<Ipv4Addr>,
+
+    /// The port to listen for broadcast triggers on
+    #[arg(default_value = "9999", long)]
+    trigger_port: u16,
 }
 
 fn send_data(
@@ -32,7 +36,7 @@ fn send_data(
     target_address: &Ipv4Addr,
     target_port: u16,
     sync: Arc<Barrier>,
-    trigger: flume::Receiver<DelugeTrigger>,
+    mut trigger: bus::BusReader<DelugeTrigger>,
 ) -> ! {
     let bind_addr: SocketAddr = format!("{source_address}:0").parse().unwrap();
     let to_addr: SocketAddr = format!("{target_address}:{target_port}").parse().unwrap();
@@ -46,7 +50,8 @@ fn send_data(
         let acq = trigger.recv().unwrap();
         println!(
             "{target_port}: Starting {} images at {:.0} Hz",
-            acq.frames, acq.exptime
+            acq.frames,
+            1.0 / acq.exptime
         );
         for _ in 0..acq.frames {
             for _ in 0..64 {
@@ -54,6 +59,7 @@ fn send_data(
 
                 let wait = acq.exptime - (Instant::now() - last_send).as_secs_f32();
                 if wait > 0.0 {
+                    println!("Wait: {wait}");
                     thread::sleep(Duration::from_secs_f32(wait));
                 }
                 last_send = Instant::now();
@@ -76,7 +82,7 @@ pub fn new_reusable_udp_socket<T: std::net::ToSocketAddrs>(
         Some(Protocol::UDP),
     )?;
     socket.set_reuse_port(true)?;
-    socket.set_nonblocking(true)?;
+    // socket.set_nonblocking(true)?;
     let addr = address.to_socket_addrs()?.next().unwrap();
     socket.bind(&addr.into())?;
     Ok(socket.into())
@@ -102,41 +108,52 @@ fn main() {
     let to_take: usize = (9 - args.to_first.unwrap_or(9)).into();
 
     let barrier = Arc::new(Barrier::new(interfaces.len() * 4));
-    let (trigger_tx, trigger_rx) = flume::bounded(1);
+    let mut bus = bus::Bus::new(1);
 
     for (port, source, target) in multizip((
-        args.target_port..(args.target_port + 8),
+        args.target_port..(args.target_port + interfaces.len() as u16 * 4),
         interfaces.iter().flat_map(|x| iter::repeat_n(*x, 4)),
         iter::repeat_n(args.target, 9)
             .chain(iter::repeat_n(args.target_2.unwrap_or(args.target), 9))
+            .cycle()
             .skip(to_take),
     )) {
         println!("Starting {source} -> {target}:{port}");
         let bar = barrier.clone();
-        let trig = trigger_rx.clone();
+        let trig = bus.add_rx();
         threads.push(thread::spawn(move || {
             send_data(&source, &target, port, bar, trig);
         }));
     }
-    drop(trigger_rx);
+
+    // drop(trigger_rx);
     // Wait for broadcasts
     let mut buf = vec![0; size_of::<DelugeTrigger>()];
     let broad = new_reusable_udp_socket("0.0.0.0:9999").unwrap();
     // let broad = UdpSocket::bind("0.0.0.0:9999").unwrap();
     // broad.recv(buf)
     // let mut last_trigger = None;
+    let mut last_trigger = None;
     loop {
-        let size = broad.recv(buf.as_mut_slice()).unwrap();
-        assert!(size == size_of::<DelugeTrigger>());
-        let trigger: &DelugeTrigger = bytemuck::from_bytes(&buf);
-        println!("Got trigger: {trigger:?}");
+        if let Ok(size) = broad.recv(buf.as_mut_slice()) {
+            assert!(size == size_of::<DelugeTrigger>());
+            let trigger: &DelugeTrigger = bytemuck::from_bytes(&buf);
+            // Ignore retriggers within 0.5 s
+            if let Some(last) = last_trigger
+                && (Instant::now() - last) < Duration::from_millis(500)
+            {
+                last_trigger = Some(Instant::now());
+                continue;
+            }
 
-        trigger_tx.send(*trigger).unwrap();
-        // last_trigger = Some(*trigger);
+            bus.broadcast(*trigger);
+            // trigger_tx.send(*trigger).unwrap();
+
+            // println!("Rec: {:?}", trigger_rx.receiver_count());
+            // println!(" Getting: {:?}", trigger_rx.recv());
+            // println!(" Barrier: {:?}", barrier.)
+            barrier.wait();
+            last_trigger = Some(Instant::now());
+        }
     }
-
-    // loop {
-    //     sleep(Duration::from_secs(5));
-    //     println!("Sending Deluge");
-    // }
 }
