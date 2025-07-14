@@ -20,11 +20,7 @@ struct Args {
     #[arg(long, short, default_value = "30000")]
     target_port: u16,
 
-    /// If set, only this many threads will be sent to the first target
-    #[arg(long)]
-    to_first: Option<u8>,
-    target: Ipv4Addr,
-    target_2: Option<Ipv4Addr>,
+    targets: Vec<Ipv4Addr>,
 
     /// The port to listen for broadcast triggers on
     #[arg(default_value = "9999", long)]
@@ -115,8 +111,6 @@ fn main() {
     // println!("Start threads");
 
     let mut threads = Vec::new();
-    // Work out the offset for target receivers
-    let to_take: usize = (9 - args.to_first.unwrap_or(9)).into();
 
     let barrier = Arc::new(Barrier::new(interfaces.len() * 4));
     let mut bus = bus::Bus::new(1);
@@ -124,10 +118,7 @@ fn main() {
     for (port, source, target) in multizip((
         args.target_port..(args.target_port + interfaces.len() as u16 * 4),
         interfaces.iter().flat_map(|x| iter::repeat_n(*x, 4)),
-        iter::repeat_n(args.target, 9)
-            .chain(iter::repeat_n(args.target_2.unwrap_or(args.target), 9))
-            .cycle()
-            .skip(to_take),
+        args.targets,
     )) {
         println!("Starting {source} -> {target}:{port}");
         let bar = barrier.clone();
