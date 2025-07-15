@@ -11,8 +11,9 @@ use std::io::IoSliceMut;
 use std::iter;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::os::fd::AsRawFd;
-// use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Barrier, mpsc};
 use thread_priority::set_current_thread_priority;
 
 use std::thread;
@@ -80,7 +81,7 @@ fn allocate_image_buffer() -> Box<[u8]> {
 //     }
 // }
 
-// static ACQUISITION_NUMBER: AtomicUsize = AtomicUsize::new(0usize);
+static ACQUISITION_NUMBER: AtomicUsize = AtomicUsize::new(0usize);
 
 #[derive(Debug, Default)]
 struct AcquisitionStats {
@@ -94,17 +95,17 @@ struct AcquisitionStats {
     out_of_order: usize,
 }
 
-// /// For reporting ongoing progress/statistics to a central thread
-// enum AcquisitionLifecycleState {
-//     /// An acquisition task is starting, along with the acquisition ID
-//     Starting { acquisition_number: usize },
-//     ImageReceived {
-//         image_number: usize,
-//         dropped_packets: usize,
-//     },
-//     /// An acquisition was ended by a thread
-//     Ended(AcquisitionStats),
-// }
+/// For reporting ongoing progress/statistics to a central thread
+enum AcquisitionLifecycleState {
+    /// An acquisition task is starting, along with the acquisition ID
+    Starting { acquisition_number: usize },
+    ImageReceived {
+        image_number: usize,
+        dropped_packets: usize,
+    },
+    /// An acquisition was ended by a thread
+    Ended(AcquisitionStats),
+}
 
 /// Start a UDP socket, with custom options
 ///
@@ -132,7 +133,12 @@ impl<'a, 's, S> RecvMessageWrapper for RecvMsg<'a, 's, S> {
     }
 }
 
-fn listen_port(address: &Ipv4Addr, port: u16, barrier: Arc<Barrier>) -> ! {
+fn listen_port(
+    address: &Ipv4Addr,
+    port: u16,
+    barrier: Arc<Barrier>,
+    state_report: Sender<(u16, AcquisitionLifecycleState)>,
+) -> ! {
     let bind_addr: SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
     let socket = start_socket(bind_addr, 512 * 1024 * 1024).unwrap();
     println!("{port}: Listening to {address}");
@@ -152,6 +158,7 @@ fn listen_port(address: &Ipv4Addr, port: u16, barrier: Arc<Barrier>) -> ! {
     loop {
         let mut stats = AcquisitionStats::default();
         let mut last_image = None;
+        let acquisition_number = ACQUISITION_NUMBER.load(Ordering::Relaxed);
 
         // Wait forever for the first image in an acquisition
         socket.set_read_timeout(None).unwrap();
@@ -171,14 +178,25 @@ fn listen_port(address: &Ipv4Addr, port: u16, barrier: Arc<Barrier>) -> ! {
                 }
             };
 
-            if let Ok(dropped) = msg.get_dropped_packets() {
+            if let Ok(dropped) = msg.get_dropped_packets()
+                && dropped > 0
+            {
                 stats.packets_dropped += dropped;
                 println!("{port}: Packet queue overflowed! {dropped} packets dropped!");
             }
-            // Once we have started an acquisition, we want to expire it when the images stop
-            socket
-                .set_read_timeout(Some(Duration::from_millis(500)))
-                .unwrap();
+            // Is this the start of a new acquisition?
+            if last_image.is_none() {
+                // Once we have started an acquisition, we want to expire it when the images stop
+                socket
+                    .set_read_timeout(Some(Duration::from_millis(500)))
+                    .unwrap();
+                state_report
+                    .send((
+                        port,
+                        AcquisitionLifecycleState::Starting { acquisition_number },
+                    ))
+                    .unwrap();
+            }
 
             // Unwrap the buffer
             let buffer = msg.iovs().next().unwrap();
@@ -296,6 +314,7 @@ fn main() {
     let mut core_ids = core_affinity::get_core_ids().unwrap().into_iter().rev();
 
     let barrier = Arc::new(Barrier::new(num_listeners));
+    let (state_tx, state_rx) = mpsc::channel::<(u16, AcquisitionLifecycleState)>();
 
     let mut threads = Vec::new();
 
@@ -307,6 +326,7 @@ fn main() {
     )) {
         let core = core_ids.next().unwrap();
         let barr = barrier.clone();
+        let stat = state_tx.clone();
         threads.push(thread::spawn(move || {
             if !core_affinity::set_for_current(core) {
                 println!("{port}: Failed to set affinity to core {}", core.id);
@@ -319,12 +339,13 @@ fn main() {
                 );
             };
 
-            listen_port(&address, port, barr);
+            listen_port(&address, port, barr, stat);
         }));
     }
 
     loop {
-        thread::sleep(Duration::from_secs(20));
+        state_rx.recv().unwrap();
+        // thread::sleep(Duration::from_secs(20));
     }
     // #[allow(clippy::never_loop)]
     // for thread in threads {
