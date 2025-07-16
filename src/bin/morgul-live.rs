@@ -1,6 +1,6 @@
 use clap::Parser;
 use itertools::multizip;
-use morgul::{SlsDetectorHeader, get_interface_addreses_with_prefix};
+use morgul::{SlsDetectorHeader, SlsDetectorType, get_interface_addreses_with_prefix};
 use nix::errno::Errno;
 use nix::sys::socket::{
     ControlMessageOwned, MsgFlags, RecvMsg, SockaddrStorage, recvmsg, setsockopt, sockopt,
@@ -9,11 +9,11 @@ use nix::sys::socket::{
 use socket2::{Domain, Socket, Type};
 use std::io::IoSliceMut;
 use std::iter;
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{SocketAddr, UdpSocket};
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Barrier, mpsc};
 use thread_priority::set_current_thread_priority;
 
 use std::thread;
@@ -93,6 +93,8 @@ struct AcquisitionStats {
     packets_dropped: usize,
     /// How many packets did we get too late to assemble
     out_of_order: usize,
+    /// How low did the image buffer queue length get?
+    min_spare_image_buffers: Option<usize>,
 }
 
 /// For reporting ongoing progress/statistics to a central thread
@@ -133,172 +135,223 @@ impl<'a, 's, S> RecvMessageWrapper for RecvMsg<'a, 's, S> {
     }
 }
 
-fn listen_port(
-    address: &Ipv4Addr,
-    port: u16,
-    barrier: Arc<Barrier>,
-    state_report: Sender<(u16, AcquisitionLifecycleState)>,
-) -> ! {
-    let bind_addr: SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
-    let socket = start_socket(bind_addr, 512 * 1024 * 1024).unwrap();
-    println!("{port}: Listening to {address}");
+struct Receiver {
+    spare_buffers: Vec<Box<[u8]>>,
+    state_reporter: Sender<(u16, AcquisitionLifecycleState)>,
+}
 
-    // The UDP receive buffer
-    let mut buffer = [0u8; size_of::<SlsDetectorHeader>() + 8192];
+impl Receiver {
+    fn start(port: u16, state_reporter: Sender<(u16, AcquisitionLifecycleState)>) -> ! {
+        // Build the image data buffers we will use
+        let spare_images: Vec<_> = std::iter::repeat_n((), THREAD_IMAGE_BUFFER_LENGTH)
+            .map(|()| allocate_image_buffer())
+            .collect();
 
-    let fd = socket.as_raw_fd();
-    let mut iov = [IoSliceMut::new(&mut buffer)];
-    let mut cmsgspace = nix::cmsg_space!(libc::c_uint);
+        let mut recv = Receiver {
+            spare_buffers: spare_images,
+            state_reporter,
+        };
+        recv.listen_port(port);
+    }
 
-    // Build the image data buffers we will use
-    let mut spare_images: Vec<_> = std::iter::repeat_n((), THREAD_IMAGE_BUFFER_LENGTH)
-        .map(|()| allocate_image_buffer())
-        .collect();
+    fn deliver_image(&mut self, image: ReceiveImage) {
+        // for now, do nothing and just return the buffer to the pool
+        self.spare_buffers.push(image.data);
+    }
 
-    loop {
-        let mut stats = AcquisitionStats::default();
-        let mut last_image = None;
-        let acquisition_number = ACQUISITION_NUMBER.load(Ordering::Relaxed);
+    fn listen_port(&mut self, port: u16) -> ! {
+        let bind_addr: SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
+        let socket = start_socket(bind_addr, 512 * 1024 * 1024).unwrap();
+        println!("{port}: Listening to 0.0.0.0");
 
-        // Wait forever for the first image in an acquisition
-        socket.set_read_timeout(None).unwrap();
+        // The UDP receive buffer
+        let mut buffer = [0u8; size_of::<SlsDetectorHeader>() + 8192];
 
-        // Many images in one acquisition
+        let fd = socket.as_raw_fd();
+        let mut iov = [IoSliceMut::new(&mut buffer)];
+        let mut cmsgspace = nix::cmsg_space!(libc::c_uint);
+
         loop {
-            let msg = match recvmsg::<SockaddrStorage>(
-                fd,
-                &mut iov,
-                Some(&mut cmsgspace),
-                MsgFlags::empty(),
-            ) {
-                Ok(msg) => msg,
-                Err(Errno::EAGAIN) => break,
-                Err(e) => {
-                    panic!("Error: {e}");
+            let mut stats = AcquisitionStats::default();
+            let acquisition_number = ACQUISITION_NUMBER.load(Ordering::Relaxed);
+            let mut is_first_image = true;
+
+            // Wait forever for the first image in an acquisition
+            socket.set_read_timeout(None).unwrap();
+
+            // Potentially keep two images around; current and (incomplete)
+            // previous image. If the current image is finished, then the
+            // previous will also get flushed, but if a new image comes in
+            // while the current is incomplete it will be demoted to the
+            // previous image.
+            let mut current_image: Option<ReceiveImage> = None;
+            let mut previous_image: Option<ReceiveImage> = None;
+
+            // Many images in one acquisition
+            loop {
+                let msg = match recvmsg::<SockaddrStorage>(
+                    fd,
+                    &mut iov,
+                    Some(&mut cmsgspace),
+                    MsgFlags::empty(),
+                ) {
+                    Ok(msg) => msg,
+                    Err(Errno::EAGAIN) => break,
+                    Err(e) => {
+                        panic!("Error: {e}");
+                    }
+                };
+
+                // If the kernel reports that we dropped packets, report it
+                if let Ok(dropped) = msg.get_dropped_packets()
+                    && dropped > 0
+                {
+                    // We can't count these in the "packets lost" counter as
+                    // we don't know how to avoid double-counting. But we
+                    // should definitely notify
+                    println!("{port}: Packet queue overflowed! {dropped} packets dropped!");
                 }
-            };
-
-            if let Ok(dropped) = msg.get_dropped_packets()
-                && dropped > 0
-            {
-                stats.packets_dropped += dropped;
-                println!("{port}: Packet queue overflowed! {dropped} packets dropped!");
-            }
-            // Is this the start of a new acquisition?
-            if last_image.is_none() {
-                // Once we have started an acquisition, we want to expire it when the images stop
-                socket
-                    .set_read_timeout(Some(Duration::from_millis(500)))
-                    .unwrap();
-                state_report
-                    .send((
-                        port,
-                        AcquisitionLifecycleState::Starting { acquisition_number },
-                    ))
-                    .unwrap();
-            }
-
-            // Unwrap the buffer
-            let buffer = msg.iovs().next().unwrap();
-
-            let header: &SlsDetectorHeader =
-                bytemuck::from_bytes(&buffer[..size_of::<SlsDetectorHeader>()]);
-
-            assert!(header.packet_number < 64);
-            assert!(msg.bytes - size_of::<SlsDetectorHeader>() == 8192);
-
-            // If no previous image, then we have a new one
-            if last_image.is_none() {
-                if stats.images_seen == 0 {
-                    println!(
-                        "New Acquisition started with frame number {}",
-                        header.frame_number
-                    );
+                // Is this the start of a new acquisition?
+                if is_first_image {
+                    is_first_image = false;
+                    // Once we have started an acquisition, we want to expire it when the images stop
+                    socket
+                        .set_read_timeout(Some(Duration::from_millis(500)))
+                        .unwrap();
+                    // Send a state update saying that we started
+                    self.state_reporter
+                        .send((
+                            port,
+                            AcquisitionLifecycleState::Starting { acquisition_number },
+                        ))
+                        .unwrap();
                 }
-                stats.images_seen += 1;
-            }
-            // Get the current WIP image or make a new one
-            let mut current_image = last_image.take().unwrap_or_else(|| ReceiveImage {
-                frame_number: header.frame_number,
-                header: *header,
-                received_packets: 0,
-                data: spare_images.pop().expect("Ran out of spare packet buffers"),
-            });
 
-            // We have a new image but didn't complete the previous frame
-            if header.frame_number != current_image.frame_number {
-                // Warn if we received packets for an old image
-                if header.frame_number < current_image.frame_number {
-                    // println!(
-                    //     "{port}: Warning: Received Out-Of-Order frame packets for image {} (current={}) after closing.",
-                    //     header.frame_number, current_image.frame_number,
-                    // );
+                // Unwrap the buffer data
+                let buffer = msg.iovs().next().unwrap();
 
-                    stats.out_of_order += 1;
-                    stats.packets_dropped -= 1;
-                    last_image = Some(current_image);
-                    continue;
+                let header: &SlsDetectorHeader =
+                    bytemuck::from_bytes(&buffer[..size_of::<SlsDetectorHeader>()]);
+
+                // Basic header validation
+                assert!(
+                    header.packet_number < 64,
+                    "Got too many packets per image; are you running in half-module mode?"
+                );
+                assert!(msg.bytes - size_of::<SlsDetectorHeader>() == 8192);
+                assert!(
+                    header.det_type == SlsDetectorType::Jungfrau as u8,
+                    "Unrecognised det_type in header: {} != Jungfrau ({})",
+                    header.det_type,
+                    SlsDetectorType::Jungfrau as u8
+                );
+
+                // Check if the new packet is for a new image
+                if let Some(curr) = current_image.take()
+                    && header.frame_number != curr.header.frame_number
+                {
+                    // We didn't complete the image before getting the new one
+                    if let Some(old_image) = previous_image {
+                        // Oh dear, this isn't going well, we have two
+                        // incomplete previous images. Let's send off the
+                        // oldest.
+                        self.deliver_image(old_image);
+                        // previous_image = None;
+                    }
+                    previous_image = Some(curr);
+                    current_image = None;
                 }
-                // Warn if we didn't receive the entire previous frame
-                if current_image.received_packets < 64 {
-                    // println!(
-                    //     "{port}: Lost packets: Image {} missed {} packets",
-                    //     current_image.frame_number,
-                    //     64 - current_image.received_packets
-                    // );
-                    stats.packets_dropped += 64 - current_image.received_packets;
-                    // Return the data back to the pool to simulate sending it
-                    spare_images.push(current_image.data);
-                }
-                // Even though we didn't complete the previous image, this is a new one
-                stats.images_seen += 1;
-                // Make a new image
-                current_image = ReceiveImage {
+                // // If no previous image, then we have a new one
+                // if last_image.is_none() {
+                //     if stats.images_seen == 0 {
+                //         println!(
+                //             "New Acquisition started with frame number {}",
+                //             header.frame_number
+                //         );
+                //     }
+                //     stats.images_seen += 1;
+                // }
+                // Get the current WIP image or make a new one
+                let mut this_image = current_image.take().unwrap_or_else(|| ReceiveImage {
                     frame_number: header.frame_number,
                     header: *header,
                     received_packets: 0,
-                    data: spare_images.pop().unwrap(),
+                    data: self
+                        .spare_buffers
+                        .pop()
+                        .expect("Ran out of spare packet buffers"),
+                });
+
+                // We have a new image but didn't complete the previous frame
+                if header.frame_number != this_image.frame_number {
+                    // Warn if we received packets for an old image
+                    if header.frame_number < this_image.frame_number {
+                        // println!(
+                        //     "{port}: Warning: Received Out-Of-Order frame packets for image {} (current={}) after closing.",
+                        //     header.frame_number, current_image.frame_number,
+                        // );
+
+                        stats.out_of_order += 1;
+                        stats.packets_dropped -= 1;
+                        current_image = Some(this_image);
+                        continue;
+                    }
+                    // Warn if we didn't receive the entire previous frame
+                    if this_image.received_packets < 64 {
+                        // println!(
+                        //     "{port}: Lost packets: Image {} missed {} packets",
+                        //     current_image.frame_number,
+                        //     64 - current_image.received_packets
+                        // );
+                        stats.packets_dropped += 64 - this_image.received_packets;
+                        // Return the data back to the pool to simulate sending it
+                        self.spare_buffers.push(this_image.data);
+                    }
+                    // Even though we didn't complete the previous image, this is a new one
+                    stats.images_seen += 1;
+                    // Make a new image
+                    this_image = ReceiveImage {
+                        frame_number: header.frame_number,
+                        header: *header,
+                        received_packets: 0,
+                        data: self.spare_buffers.pop().unwrap(),
+                    }
                 }
-            }
-            assert!(header.frame_number == current_image.frame_number);
+                assert!(header.frame_number == this_image.frame_number);
 
-            // Add a packet to this image
-            current_image.received_packets += 1;
-            // Copy the new data into the image data at the right place
-            current_image.data[(header.packet_number as usize * 8192usize)
-                ..((header.packet_number as usize + 1) * 8192usize)]
-                .copy_from_slice(&buffer[size_of::<SlsDetectorHeader>()..]);
+                // Add a packet to this image
+                this_image.received_packets += 1;
+                // Copy the new data into the image data at the right place
+                this_image.data[(header.packet_number as usize * 8192usize)
+                    ..((header.packet_number as usize + 1) * 8192usize)]
+                    .copy_from_slice(&buffer[size_of::<SlsDetectorHeader>()..]);
 
-            // If we've received an entire image, then process it
-            if current_image.received_packets == 64 {
-                // println!(
-                //     "{port}: Received entire image {}",
-                //     current_image.frame_number
-                // );
-                spare_images.push(current_image.data);
-                last_image = None;
-                stats.complete_images += 1;
-                // socket.set_read_timeout(None).unwrap();
-            } else {
-                last_image = Some(current_image);
-            }
-        } // Acquisition loop
+                // If we've received an entire image, then process it
+                if this_image.received_packets == 64 {
+                    // println!(
+                    //     "{port}: Received entire image {}",
+                    //     current_image.frame_number
+                    // );
+                    self.spare_buffers.push(this_image.data);
+                    current_image = None;
+                    stats.complete_images += 1;
+                    // socket.set_read_timeout(None).unwrap();
+                } else {
+                    current_image = Some(this_image);
+                }
+            } // Acquisition loop
 
-        println!(
-            "{port}: End of acquisition, seen {is} images, {ci} complete, {pd} packets dropped, {ooo} out-of-order.",
-            is = stats.images_seen,
-            ci = stats.complete_images,
-            pd = stats.packets_dropped,
-            ooo = stats.out_of_order
-        );
-        let b = barrier.wait();
-        if b.is_leader() {
-            println!("All threads finished acquisition.");
+            println!(
+                "{port}: End of acquisition, seen {is} images, {ci} complete, {pd} packets dropped, {ooo} out-of-order.",
+                is = stats.images_seen,
+                ci = stats.complete_images,
+                pd = stats.packets_dropped,
+                ooo = stats.out_of_order
+            );
+            continue;
         }
-        continue;
     }
 }
-
 fn main() {
     let args = Args::parse();
     println!("Args: {args:?}");
@@ -313,19 +366,17 @@ fn main() {
     // Get a list of cores so that we can set affinity to them
     let mut core_ids = core_affinity::get_core_ids().unwrap().into_iter().rev();
 
-    let barrier = Arc::new(Barrier::new(num_listeners));
     let (state_tx, state_rx) = mpsc::channel::<(u16, AcquisitionLifecycleState)>();
 
     let mut threads = Vec::new();
 
-    for (port, address) in multizip((
+    for (port, _address) in multizip((
         args.udp_port..(args.udp_port + num_listeners as u16),
         interfaces
             .iter()
             .flat_map(|x| iter::repeat_n(*x, LISTENERS_PER_PORT)),
     )) {
         let core = core_ids.next().unwrap();
-        let barr = barrier.clone();
         let stat = state_tx.clone();
         threads.push(thread::spawn(move || {
             if !core_affinity::set_for_current(core) {
@@ -339,7 +390,7 @@ fn main() {
                 );
             };
 
-            listen_port(&address, port, barr, stat);
+            Receiver::start(port, stat);
         }));
     }
 

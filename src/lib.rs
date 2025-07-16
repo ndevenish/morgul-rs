@@ -53,6 +53,35 @@ pub struct SlsDetectorHeader {
     pub version: u8,
 }
 
+pub enum SlsDetectorType {
+    Generic = 0,
+    Eiger = 1,
+    Gotthard = 2,
+    Jungfrau = 3,
+    ChipTestBoard = 4,
+    Moench = 5,
+    Mythen3 = 6,
+    Gotthard2 = 7,
+}
+
+impl TryFrom<u8> for SlsDetectorType {
+    type Error = ();
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(SlsDetectorType::Generic),
+            1 => Ok(SlsDetectorType::Eiger),
+            2 => Ok(SlsDetectorType::Gotthard),
+            3 => Ok(SlsDetectorType::Jungfrau),
+            4 => Ok(SlsDetectorType::ChipTestBoard),
+            5 => Ok(SlsDetectorType::Moench),
+            6 => Ok(SlsDetectorType::Mythen3),
+            7 => Ok(SlsDetectorType::Gotthard2),
+            _ => Err(()),
+        }
+    }
+}
+
 pub fn get_interface_addreses_with_prefix(prefix: u8) -> Vec<Ipv4Addr> {
     let mut addresses: Vec<_> = datalink::interfaces()
         .iter()
