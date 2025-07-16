@@ -58,29 +58,6 @@ fn allocate_image_buffer() -> Box<[u8]> {
     empty_image.into_boxed_slice()
 }
 
-/// Elect a leader by selecting the first thread through.
-///
-/// The intention of how this differs from a standard [Barrier] in that
-/// it elects a leader but does not require a fixed number of threads
-/// known up-front at creation time. This is important because some of
-/// the senders might fail to send or be blocked (e.g. a module dies),
-/// and we don't want the entire data pipeline to fail in these cases.
-// #[derive(Debug)]
-// struct IsFirstThread {
-//     is_first: AtomicBool,
-// }
-
-// impl IsFirstThread {
-//     fn try_claim(&mut self) -> bool {
-//         self.is_first
-//             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-//             .is_ok()
-//     }
-//     fn reset(&self) {
-//         self.is_first.store(false, Ordering::SeqCst);
-//     }
-// }
-
 static ACQUISITION_NUMBER: AtomicUsize = AtomicUsize::new(0usize);
 
 #[derive(Debug, Default)]
@@ -245,78 +222,41 @@ impl Receiver {
                     header.det_type,
                     SlsDetectorType::Jungfrau as u8
                 );
+                assert!(
+                    header.version == 2,
+                    "Unknown sls_detector_header version: {}",
+                    header.version
+                );
 
-                // Check if the new packet is for a new image
-                if let Some(curr) = current_image.take()
+                // If new packet is for a new image, handle any previous, incomplete images
+                if let Some(ref curr) = current_image
                     && header.frame_number != curr.header.frame_number
                 {
-                    // We didn't complete the image before getting the new one
-                    if let Some(old_image) = previous_image {
+                    if let Some(old_image) = previous_image.take() {
                         // Oh dear, this isn't going well, we have two
                         // incomplete previous images. Let's send off the
-                        // oldest.
+                        // oldest even though it is incomplete and count
+                        // the dropped packets.
+                        stats.packets_dropped += 64 - old_image.received_packets;
                         self.deliver_image(old_image);
-                        // previous_image = None;
                     }
-                    previous_image = Some(curr);
-                    current_image = None;
+                    previous_image = current_image.take()
                 }
-                // // If no previous image, then we have a new one
-                // if last_image.is_none() {
-                //     if stats.images_seen == 0 {
-                //         println!(
-                //             "New Acquisition started with frame number {}",
-                //             header.frame_number
-                //         );
-                //     }
-                //     stats.images_seen += 1;
-                // }
+
                 // Get the current WIP image or make a new one
-                let mut this_image = current_image.take().unwrap_or_else(|| ReceiveImage {
-                    frame_number: header.frame_number,
-                    header: *header,
-                    received_packets: 0,
-                    data: self
-                        .spare_buffers
-                        .pop()
-                        .expect("Ran out of spare packet buffers"),
-                });
-
-                // We have a new image but didn't complete the previous frame
-                if header.frame_number != this_image.frame_number {
-                    // Warn if we received packets for an old image
-                    if header.frame_number < this_image.frame_number {
-                        // println!(
-                        //     "{port}: Warning: Received Out-Of-Order frame packets for image {} (current={}) after closing.",
-                        //     header.frame_number, current_image.frame_number,
-                        // );
-
-                        stats.out_of_order += 1;
-                        stats.packets_dropped -= 1;
-                        current_image = Some(this_image);
-                        continue;
-                    }
-                    // Warn if we didn't receive the entire previous frame
-                    if this_image.received_packets < 64 {
-                        // println!(
-                        //     "{port}: Lost packets: Image {} missed {} packets",
-                        //     current_image.frame_number,
-                        //     64 - current_image.received_packets
-                        // );
-                        stats.packets_dropped += 64 - this_image.received_packets;
-                        // Return the data back to the pool to simulate sending it
-                        self.spare_buffers.push(this_image.data);
-                    }
-                    // Even though we didn't complete the previous image, this is a new one
+                let mut this_image = current_image.take().unwrap_or_else(|| {
                     stats.images_seen += 1;
-                    // Make a new image
-                    this_image = ReceiveImage {
+                    ReceiveImage {
                         frame_number: header.frame_number,
                         header: *header,
                         received_packets: 0,
-                        data: self.spare_buffers.pop().unwrap(),
+                        data: self
+                            .spare_buffers
+                            .pop()
+                            .expect("Ran out of spare packet buffers"),
                     }
-                }
+                });
+
                 assert!(header.frame_number == this_image.frame_number);
 
                 // Add a packet to this image
@@ -326,17 +266,13 @@ impl Receiver {
                     ..((header.packet_number as usize + 1) * 8192usize)]
                     .copy_from_slice(&buffer[size_of::<SlsDetectorHeader>()..]);
 
-                // If we've received an entire image, then process it
+                // If we've received an entire image, then send it
                 if this_image.received_packets == 64 {
-                    // println!(
-                    //     "{port}: Received entire image {}",
-                    //     current_image.frame_number
-                    // );
-                    self.spare_buffers.push(this_image.data);
-                    current_image = None;
                     stats.complete_images += 1;
-                    // socket.set_read_timeout(None).unwrap();
+                    self.deliver_image(this_image);
+                    debug_assert!(current_image.is_none());
                 } else {
+                    // Push it back
                     current_image = Some(this_image);
                 }
             } // Acquisition loop
